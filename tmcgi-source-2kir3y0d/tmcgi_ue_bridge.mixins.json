@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "dev.leon.tmcgiue.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": ["LevelChunkMixin", "GameRendererMixin", "MinecraftMixin", "InputConstantsMixin", "SubmitNodeStorageMixin", "ParticleEngineMixin", "VideoSettingsScreenMixin", "FrontendRenderPassMixin", "FrontendCommandEncoderMixin", "OptionsSubScreenAccessor"],
+  "injectors": { "defaultRequire": 1 }
+}

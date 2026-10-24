@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "tmcgi_ue_bridge",
+  "version": "0.2.3-alpha",
+  "name": "TMCGI UE Bridge",
+  "description": "Sends the loaded world and the camera to the TMCGI Unreal Engine renderer over a local TCP connection.",
+  "authors": ["Leon Li"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.leon.tmcgiue.TmcgiUeBridgeClient"]
+  },
+  "mixins": ["tmcgi_ue_bridge.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
