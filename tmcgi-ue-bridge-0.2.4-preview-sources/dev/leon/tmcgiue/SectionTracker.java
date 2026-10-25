@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
@@ -259,7 +260,7 @@ final class SectionTracker {
 
                                 Deferred section = (Deferred)this.deferred.remove(key);
                                 if (section != null && this.level != null && this.sentChunks.contains(chunkKey(section.chunkX(), section.chunkZ()))) {
-                                    this.finishSection(section.chunkX(), section.sectionY(), section.chunkZ(), section.index(), section.urgent(), section.palette(), section.indices(), section.emitterNames(), section.emitterInfos());
+                                    this.finishSection(section.chunkX(), section.sectionY(), section.chunkZ(), section.index(), section.urgent(), section.palette(), section.paletteStates(), section.indices(), section.emitterNames(), section.emitterInfos());
                                 }
                             }
 
@@ -549,6 +550,8 @@ final class SectionTracker {
                     short[] indices = new short[5832];
                     List<String> palette = new ArrayList();
                     palette.add("minecraft:air");
+                    List<BlockState> paletteStates = new ArrayList();
+                    paletteStates.add((Object)null);
                     IdentityHashMap<BlockState, Integer> ids = new IdentityHashMap();
                     IdentityHashMap<BlockState, Boolean> opaque = new IdentityHashMap();
                     boolean mayShowFace = false;
@@ -596,6 +599,7 @@ final class SectionTracker {
                                         known = palette.size();
                                         String stateName = BlockStateNames.of(state);
                                         palette.add(stateName);
+                                        paletteStates.add(state);
                                         if (!this.export.isReady(stateName)) {
                                             this.export.request(stateName, state, isUrgent);
                                             waitingFor.add(stateName);
@@ -626,16 +630,16 @@ final class SectionTracker {
                         }
 
                     } else if (!waitingFor.isEmpty()) {
-                        this.deferred.put(sectionKey(chunkX, sectionY, chunkZ), new Deferred(isUrgent, chunkX, sectionY, chunkZ, index, palette, indices, emitterNames, emitterInfos, waitingFor));
+                        this.deferred.put(sectionKey(chunkX, sectionY, chunkZ), new Deferred(isUrgent, chunkX, sectionY, chunkZ, index, palette, paletteStates, indices, emitterNames, emitterInfos, waitingFor));
                     } else {
-                        this.finishSection(chunkX, sectionY, chunkZ, index, isUrgent, palette, indices, emitterNames, emitterInfos);
+                        this.finishSection(chunkX, sectionY, chunkZ, index, isUrgent, palette, paletteStates, indices, emitterNames, emitterInfos);
                     }
                 }
             }
         }
     }
 
-    private void finishSection(int chunkX, int sectionY, int chunkZ, int index, boolean isUrgent, List<String> palette, short[] indices, List<String> emitterNames, List<int[]> emitterInfos) {
+    private void finishSection(int chunkX, int sectionY, int chunkZ, int index, boolean isUrgent, List<String> palette, List<BlockState> paletteStates, short[] indices, List<String> emitterNames, List<int[]> emitterInfos) {
         BitSet sent = (BitSet)this.sentSections.computeIfAbsent(chunkKey(chunkX, chunkZ), (k) -> {
             return new BitSet();
         });
@@ -654,8 +658,54 @@ final class SectionTracker {
             this.emissionSent.addAll(newNames);
         }
 
-        this.connection.send(BridgeProtocol.section(chunkX, sectionY, chunkZ, ++this.revision & Integer.MAX_VALUE | (isUrgent ? Integer.MIN_VALUE : 0), palette, indices));
+        this.connection.send(BridgeProtocol.section(chunkX, sectionY, chunkZ, ++this.revision & Integer.MAX_VALUE | (isUrgent ? Integer.MIN_VALUE : 0), palette, indices, this.worldTints(chunkX, sectionY, chunkZ, palette, paletteStates, indices)));
         sent.set(index);
+    }
+
+    private int[] worldTints(int chunkX, int sectionY, int chunkZ, List<String> palette, List<BlockState> paletteStates, short[] indices) {
+        int[][] tintsOf = new int[palette.size()][];
+        boolean any = false;
+
+        for(int id = 1; id < palette.size(); ++id) {
+            tintsOf[id] = this.export.worldTints((String)palette.get(id));
+            any |= tintsOf[id] != null;
+        }
+
+        if (any && this.level != null) {
+            BlockColors colors = Minecraft.getInstance().getBlockColors();
+            int[] out = new int[256];
+            int count = 0;
+            BlockPos.MutableBlockPos position = new BlockPos.MutableBlockPos();
+
+            for(int y = 0; y < 16; ++y) {
+                for(int z = 0; z < 16; ++z) {
+                    for(int x = 0; x < 16; ++x) {
+                        int id = indices[((y + 1) * 18 + z + 1) * 18 + x + 1];
+                        int[] tints = id > 0 ? tintsOf[id] : null;
+                        if (tints != null) {
+                            BlockState state = (BlockState)paletteStates.get(id);
+                            position.set((chunkX << 4) + x, (sectionY << 4) + y, (chunkZ << 4) + z);
+                            int[] var19 = tints;
+                            int var20 = tints.length;
+
+                            for(int var21 = 0; var21 < var20; ++var21) {
+                                int tint = var19[var21];
+                                if (count + 2 > out.length) {
+                                    out = Arrays.copyOf(out, out.length * 2);
+                                }
+
+                                out[count++] = x + 16 * z + 256 * y << 8 | tint;
+                                out[count++] = colors.getTintSource(state, tint).colorInWorld(state, this.level, position) & 16777215;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Arrays.copyOf(out, count);
+        } else {
+            return new int[0];
+        }
     }
 
     private static record Event(int kind, long key) {
@@ -673,14 +723,15 @@ final class SectionTracker {
         }
     }
 
-    private static record Deferred(boolean urgent, int chunkX, int sectionY, int chunkZ, int index, List<String> palette, short[] indices, List<String> emitterNames, List<int[]> emitterInfos, List<String> waiting) {
-        private Deferred(boolean urgent, int chunkX, int sectionY, int chunkZ, int index, List<String> palette, short[] indices, List<String> emitterNames, List<int[]> emitterInfos, List<String> waiting) {
+    private static record Deferred(boolean urgent, int chunkX, int sectionY, int chunkZ, int index, List<String> palette, List<BlockState> paletteStates, short[] indices, List<String> emitterNames, List<int[]> emitterInfos, List<String> waiting) {
+        private Deferred(boolean urgent, int chunkX, int sectionY, int chunkZ, int index, List<String> palette, List<BlockState> paletteStates, short[] indices, List<String> emitterNames, List<int[]> emitterInfos, List<String> waiting) {
             this.urgent = urgent;
             this.chunkX = chunkX;
             this.sectionY = sectionY;
             this.chunkZ = chunkZ;
             this.index = index;
             this.palette = palette;
+            this.paletteStates = paletteStates;
             this.indices = indices;
             this.emitterNames = emitterNames;
             this.emitterInfos = emitterInfos;
@@ -709,6 +760,10 @@ final class SectionTracker {
 
         public List<String> palette() {
             return this.palette;
+        }
+
+        public List<BlockState> paletteStates() {
+            return this.paletteStates;
         }
 
         public short[] indices() {

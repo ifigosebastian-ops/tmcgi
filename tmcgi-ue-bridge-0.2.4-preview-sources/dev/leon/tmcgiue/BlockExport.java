@@ -8,8 +8,6 @@ package dev.leon.tmcgiue;
 import com.mojang.blaze3d.platform.NativeImage;
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -18,12 +16,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockTintSource;
 import net.minecraft.client.model.geom.builders.UVPair;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
@@ -54,9 +54,11 @@ final class BlockExport {
         return thread(runnable, "TMCGI-Export", 4);
     });
     private final Set<String> ready = ConcurrentHashMap.newKeySet();
+    private final Map<String, int[]> worldTints = new ConcurrentHashMap();
     private final Map<String, Task> pending = new ConcurrentHashMap();
     private final Set<String> texturesSent = new HashSet();
     private final Object textureLock = new Object();
+    private final Object readyLock = new Object();
     private final AtomicInteger finished = new AtomicInteger();
     private volatile int generation;
     private int models;
@@ -98,9 +100,13 @@ final class BlockExport {
     }
 
     void reset() {
-        ++this.generation;
-        this.ready.clear();
-        this.pending.clear();
+        synchronized(this.readyLock) {
+            ++this.generation;
+            this.ready.clear();
+            this.pending.clear();
+            this.worldTints.clear();
+        }
+
         synchronized(this.textureLock) {
             this.texturesSent.clear();
         }
@@ -108,6 +114,10 @@ final class BlockExport {
 
     boolean isReady(String name) {
         return this.ready.contains(name);
+    }
+
+    int[] worldTints(String name) {
+        return (int[])this.worldTints.get(name);
     }
 
     int finishedCount() {
@@ -178,16 +188,18 @@ final class BlockExport {
             model.collectParts(RandomSource.create(42L), parts);
             List<float[]> quads = new ArrayList();
             Map<String, Integer> textureIndex = new LinkedHashMap();
-            Iterator var8 = parts.iterator();
+            List<BlockTintSource> tintSources = Minecraft.getInstance().getBlockColors().getTintSources(state);
+            TreeSet<Integer> inWorld = new TreeSet();
+            Iterator var10 = parts.iterator();
 
-            while(var8.hasNext()) {
-                BlockStateModelPart part = (BlockStateModelPart)var8.next();
+            while(var10.hasNext()) {
+                BlockStateModelPart part = (BlockStateModelPart)var10.next();
 
                 for(int cull = 0; cull < CULLS.length; ++cull) {
-                    Iterator var11 = part.getQuads(CULLS[cull]).iterator();
+                    Iterator var13 = part.getQuads(CULLS[cull]).iterator();
 
-                    while(var11.hasNext()) {
-                        BakedQuad quad = (BakedQuad)var11.next();
+                    while(var13.hasNext()) {
+                        BakedQuad quad = (BakedQuad)var13.next();
                         BakedQuad.MaterialInfo info = quad.materialInfo();
                         TextureAtlasSprite sprite = info.sprite();
                         Identifier spriteName = sprite.contents().name();
@@ -203,9 +215,23 @@ final class BlockExport {
                         float v0 = sprite.getV0();
                         float du = Math.max(sprite.getU1() - u0, 1.0E-9F);
                         float dv = Math.max(sprite.getV1() - v0, 1.0E-9F);
-                        float[] data = new float[24];
+                        float[] data = new float[26];
                         data[0] = (float)(cull - 1);
                         data[1] = (float)info.tintIndex();
+                        boolean hasTintColor = false;
+                        int tintColor = 0;
+                        if (info.tintIndex() >= 0 && info.tintIndex() < tintSources.size()) {
+                            BlockTintSource source = (BlockTintSource)tintSources.get(info.tintIndex());
+                            if (!source.relevantProperties().isEmpty()) {
+                                hasTintColor = true;
+                                tintColor = source.color(state) & 16777215;
+                            } else {
+                                inWorld.add(info.tintIndex());
+                            }
+                        }
+
+                        data[24] = hasTintColor ? 1.0F : 0.0F;
+                        data[25] = (float)tintColor;
                         data[2] = info.layer().translucent() ? 1.0F : 0.0F;
                         data[3] = (float)index;
 
@@ -225,6 +251,10 @@ final class BlockExport {
             }
 
             if (!quads.isEmpty()) {
+                if (!inWorld.isEmpty()) {
+                    this.worldTints.put(name, inWorld.stream().mapToInt(Integer::intValue).toArray());
+                }
+
                 int occlusion = 0;
                 if (state.canOcclude()) {
                     for(int face = 0; face < 6; ++face) {
@@ -237,15 +267,15 @@ final class BlockExport {
                 List<float[]> boxes = new ArrayList();
 
                 try {
-                    Iterator var33 = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs().iterator();
+                    Iterator var37 = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs().iterator();
 
-                    while(var33.hasNext()) {
-                        AABB box = (AABB)var33.next();
+                    while(var37.hasNext()) {
+                        AABB box = (AABB)var37.next();
                         if (boxes.size() < 64) {
                             boxes.add(new float[]{(float)box.minX, (float)box.minY, (float)box.minZ, (float)box.maxX, (float)box.maxY, (float)box.maxZ});
                         }
                     }
-                } catch (RuntimeException var29) {
+                } catch (RuntimeException var33) {
                     boxes.clear();
                 }
 
@@ -277,14 +307,7 @@ final class BlockExport {
                     Object image = ORIGINAL_IMAGE.get(contents);
                     if (image instanceof NativeImage) {
                         NativeImage nativeImage = (NativeImage)image;
-                        Path temp = Files.createTempFile("tmcgi-sprite", ".png");
-
-                        try {
-                            nativeImage.writeToFile(temp);
-                            png = Files.readAllBytes(temp);
-                        } finally {
-                            Files.deleteIfExists(temp);
-                        }
+                        png = EntityCapture.encodePng(nativeImage);
                     }
                 }
 
@@ -326,25 +349,59 @@ final class BlockExport {
 
         void run(boolean urgent) {
             if (this.claimed.compareAndSet(false, true)) {
-                try {
-                    if (this.generation == BlockExport.this.generation) {
-                        BlockExport.this.sendFluidTextures();
-                        BlockExport.this.export(this.name, this.state, urgent);
+                boolean var13 = false;
+
+                label168: {
+                    try {
+                        var13 = true;
+                        if (this.generation == BlockExport.this.generation) {
+                            BlockExport.this.sendFluidTextures();
+                            BlockExport.this.export(this.name, this.state, urgent);
+                            var13 = false;
+                        } else {
+                            var13 = false;
+                        }
+                        break label168;
+                    } catch (ReflectiveOperationException | IOException | RuntimeException var17) {
+                        Exception e = var17;
+                        if (BlockExport.FAILED.add(this.name)) {
+                            TmcgiUeBridgeClient.LOGGER.warn("The model of {} could not be exported", this.name, e);
+                            var13 = false;
+                        } else {
+                            var13 = false;
+                        }
+                    } finally {
+                        if (var13) {
+                            synchronized(BlockExport.this.readyLock) {
+                                if (this.generation == BlockExport.this.generation) {
+                                    BlockExport.this.ready.add(this.name);
+                                }
+                            }
+
+                            BlockExport.this.pending.remove(this.name, this);
+                            BlockExport.this.finished.incrementAndGet();
+                        }
                     }
-                } catch (ReflectiveOperationException | IOException | RuntimeException var6) {
-                    Exception e = var6;
-                    if (BlockExport.FAILED.add(this.name)) {
-                        TmcgiUeBridgeClient.LOGGER.warn("The model of {} could not be exported", this.name, e);
-                    }
-                } finally {
-                    if (this.generation == BlockExport.this.generation) {
-                        BlockExport.this.ready.add(this.name);
+
+                    synchronized(BlockExport.this.readyLock) {
+                        if (this.generation == BlockExport.this.generation) {
+                            BlockExport.this.ready.add(this.name);
+                        }
                     }
 
                     BlockExport.this.pending.remove(this.name, this);
                     BlockExport.this.finished.incrementAndGet();
+                    return;
                 }
 
+                synchronized(BlockExport.this.readyLock) {
+                    if (this.generation == BlockExport.this.generation) {
+                        BlockExport.this.ready.add(this.name);
+                    }
+                }
+
+                BlockExport.this.pending.remove(this.name, this);
+                BlockExport.this.finished.incrementAndGet();
             }
         }
     }

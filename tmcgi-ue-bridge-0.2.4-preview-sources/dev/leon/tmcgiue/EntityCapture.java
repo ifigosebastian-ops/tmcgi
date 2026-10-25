@@ -8,11 +8,13 @@ package dev.leon.tmcgiue;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.vertex.PoseStack;
 import dev.leon.tmcgiue.core.MeshCache;
 import dev.leon.tmcgiue.core.NeutralMesh;
 import dev.leon.tmcgiue.platform.CustomGeometryRecorder;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -20,6 +22,8 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.Channels;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -49,8 +53,11 @@ import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.MovingBlockRenderState;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
+import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
+import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
+import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.state.OptionsRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
@@ -61,19 +68,27 @@ import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.client.resources.model.geometry.ItemQuads;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LightningBolt;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
 import org.joml.Quaternionf;
+import org.joml.Vector3d;
 import org.joml.Vector3f;
 import org.joml.Vector3fc;
 
@@ -87,6 +102,7 @@ public final class EntityCapture {
     private static final Set<String> REPORTED = new HashSet();
     private final BridgeConnection connection;
     private final Map<ModelPart.Cube, Integer> cubeIds = new IdentityHashMap();
+    private final Map<ModelPart.Cube, Integer> maskCubeIds = new IdentityHashMap();
     private final List<byte[]> cubeFrames = new ArrayList();
     private final Map<Identifier, Integer> textureIds = new HashMap();
     private final List<byte[]> textureFrames = new ArrayList();
@@ -102,8 +118,6 @@ public final class EntityCapture {
     private final Map<Long, Integer> flameCubes = new HashMap();
     private long gameTicks;
     private static final int HAND_ENTITY = -2147483641;
-    private static final Method BOB_HURT = bob("bobHurt");
-    private static final Method BOB_VIEW = bob("bobView");
     private final Map<ItemQuads, List<ItemPart>> itemParts = new IdentityHashMap();
     private final Map<Identifier, Integer> stripFrames = new HashMap();
     private final LabelExport labels = new LabelExport();
@@ -120,6 +134,9 @@ public final class EntityCapture {
     private ByteArrayOutputStream records;
     private int recordCount;
     private int currentEntity;
+    private int lastModelTexture;
+    private Model<?> lastModel;
+    private List<ModelPart.Cube> maskSources;
     private int currentLayer;
     private final List<float[]> cubeCenters;
     private final Set<Integer> seenBolts;
@@ -136,11 +153,18 @@ public final class EntityCapture {
     private long debugSwing;
     private float debugShear;
     private String debugType;
+    private double maskSurface;
     private final Map<List<BakedQuad>, List<ItemPart>> meshParts;
+    private static final Method WRITE_TO_CHANNEL;
+    private static final int FLAG_SHADOW_ONLY = 256;
+    private static final int FLAG_NO_SHADOW = 512;
+    private boolean shadowOnly;
+    private final Vector3d entityPosition;
 
     public EntityCapture(BridgeConnection connection) {
         this.scratch = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN);
         this.sentGeneration = -1;
+        this.lastModelTexture = -1;
         this.cubeCenters = new ArrayList();
         this.seenBolts = new HashSet();
         this.layerMatrix = new Matrix4f();
@@ -152,7 +176,12 @@ public final class EntityCapture {
         Arrays.fill(this.debugMax, -9.0F);
         this.debugType = "";
         this.meshParts = new HashMap();
+        this.entityPosition = new Vector3d();
         this.connection = connection;
+    }
+
+    void close() {
+        this.labels.close();
     }
 
     private static Field field(Class<?> type, String name) {
@@ -202,14 +231,14 @@ public final class EntityCapture {
                 this.debugLine.setLength(0);
             }
 
-            Iterator var18;
+            Iterator var19;
             if (DEBUG && (this.debugEntity < 0 || System.nanoTime() - this.debugPick > 6000000000L)) {
                 this.debugPick = System.nanoTime();
                 this.debugEntity = -1;
-                var18 = level.entitiesForRendering().iterator();
+                var19 = level.entitiesForRendering().iterator();
 
-                while(var18.hasNext()) {
-                    Entity e = (Entity)var18.next();
+                while(var19.hasNext()) {
+                    Entity e = (Entity)var19.next();
                     if (e != camera.entity() && e instanceof LivingEntity) {
                         LivingEntity living = (LivingEntity)e;
                         if (living.walkAnimation.speed() > 0.3F && e.distanceToSqr(cameraPosition) < 4096.0) {
@@ -224,21 +253,21 @@ public final class EntityCapture {
             this.recordCount = 0;
             this.meshes.beginFrame();
             this.customOrdinals.clear();
-            var18 = this.labels.drain().iterator();
+            var19 = this.labels.drain().iterator();
 
-            while(var18.hasNext()) {
-                LabelExport.Label label = (LabelExport.Label)var18.next();
+            while(var19.hasNext()) {
+                LabelExport.Label label = (LabelExport.Label)var19.next();
                 int id = this.textureFrames.size();
                 this.textureFrames.add(pngTextureFrame(id, "tmcgi:label/" + Integer.toHexString(label.key().hashCode()) + "_" + id, label.png()));
                 this.labelTextures.put(label.key(), id);
             }
 
             double rangeSquared = 9216.0;
-            Iterator var23 = level.entitiesForRendering().iterator();
+            Iterator var24 = level.entitiesForRendering().iterator();
 
             while(true) {
-                while(var23.hasNext()) {
-                    Entity entity = (Entity)var23.next();
+                while(var24.hasNext()) {
+                    Entity entity = (Entity)var24.next();
                     if (entity instanceof LightningBolt) {
                         if (this.seenBolts.size() > 512) {
                             this.seenBolts.clear();
@@ -247,10 +276,15 @@ public final class EntityCapture {
                         if (this.seenBolts.add(entity.getId())) {
                             this.connection.sendUrgent(BridgeProtocol.lightning(entity.getX(), entity.getY(), entity.getZ(), (long)entity.getId()));
                         }
-                    } else if (!(entity.distanceToSqr(cameraPosition) > rangeSquared) && (entity != camera.entity() || camera.isDetached())) {
+                    } else if (!(entity.distanceToSqr(cameraPosition) > rangeSquared)) {
+                        this.shadowOnly = entity == camera.entity() && !camera.isDetached();
+
                         try {
                             EntityRenderState state = dispatcher.extractEntity(entity, partialTick);
                             this.currentEntity = entity.getId();
+                            this.entityPosition.set(state.x, state.y, state.z);
+                            this.lastModelTexture = -1;
+                            this.lastModel = null;
                             this.currentLayer = 0;
                             PoseStack poseStack = new PoseStack();
                             int recordsBefore = this.recordCount;
@@ -264,12 +298,22 @@ public final class EntityCapture {
                             if (var10000.add(var10001 + (made > 0 ? "+" : "-"))) {
                                 TmcgiUeBridgeClient.LOGGER.info("Entity {} recorded {} part(s)", entity.getType(), made);
                             }
-                        } catch (RuntimeException var17) {
-                            RuntimeException e = var17;
+                        } catch (RuntimeException var18) {
+                            RuntimeException e = var18;
                             if (FAILED.add(entity.getType())) {
                                 TmcgiUeBridgeClient.LOGGER.warn("Entity {} could not be recorded", entity.getType(), e);
                             }
                         }
+                    }
+                }
+
+                this.shadowOnly = false;
+
+                try {
+                    this.recordBlockEntities(minecraft, renderer, cameraPosition, rangeSquared);
+                } catch (RuntimeException var17) {
+                    if (FAILED.add("blockEntities")) {
+                        TmcgiUeBridgeClient.LOGGER.warn("The block entities could not be recorded", var17);
                     }
                 }
 
@@ -282,8 +326,8 @@ public final class EntityCapture {
                 }
 
                 this.meshes.endFrame();
-                if (this.connection.generation() != this.sentGeneration) {
-                    this.sentGeneration = this.connection.generation();
+                if (this.connection.epoch() != this.sentGeneration) {
+                    this.sentGeneration = this.connection.epoch();
                     this.sentCubes = 0;
                     this.sentTextures = 0;
                 }
@@ -293,10 +337,10 @@ public final class EntityCapture {
                     ++this.sentTextures;
                 }
 
-                var23 = this.replacedCubes.iterator();
+                var24 = this.replacedCubes.iterator();
 
-                while(var23.hasNext()) {
-                    int id = (Integer)var23.next();
+                while(var24.hasNext()) {
+                    int id = (Integer)var24.next();
                     if (id < this.sentCubes) {
                         this.connection.sendUrgent((byte[])this.cubeFrames.get(id));
                     }
@@ -331,7 +375,7 @@ public final class EntityCapture {
             if (name.equals("order")) {
                 return proxy;
             } else if (name.equals("submitModel") && args != null && args.length == 9 && args[3] instanceof RenderType) {
-                this.record((Model)args[0], args[1], (PoseStack)args[2], (RenderType)args[3], (Integer)args[5], (Integer)args[6]);
+                this.record((Model)args[0], args[1], (PoseStack)args[2], (RenderType)args[3], (Integer)args[5], (Integer)args[6], args[7]);
                 return null;
             } else if (name.equals("submitItem") && args != null && args.length == 8) {
                 this.recordItem((PoseStack)args[0], (int[])args[5], (ItemQuads)args[6]);
@@ -348,6 +392,9 @@ public final class EntityCapture {
                 return null;
             } else if (name.equals("submitNameTag") && args != null && args.length == 7) {
                 this.recordNameTag((PoseStack)args[0], (Vec3)args[1], (Integer)args[2], (Component)args[3], (CameraRenderState)args[6]);
+                return null;
+            } else if (name.equals("submitText") && args != null && args.length == 10) {
+                this.recordText((PoseStack)args[0], (Float)args[1], (Float)args[2], (FormattedCharSequence)args[3], (Integer)args[7], (Integer)args[9]);
                 return null;
             } else if (name.equals("submitFlame") && args != null && args.length == 3) {
                 this.recordFlame((PoseStack)args[0], (EntityRenderState)args[1], (Quaternionf)args[2]);
@@ -376,6 +423,22 @@ public final class EntityCapture {
 
                 int texture = this.textureOf(renderType);
                 int flags = flagsOf(renderType);
+                if (isEndPortal(renderType)) {
+                    Identifier layers = textureLocation(renderType, "Sampler1");
+                    if (layers != null) {
+                        texture = this.textureOf(layers);
+                    }
+
+                    flags |= 2;
+                    float ox = mesh.positions[0];
+                    float oz = mesh.positions[2];
+
+                    for(int i = 0; i < mesh.vertexCount; ++i) {
+                        mesh.uvs[2 * i] = mesh.positions[3 * i] - ox;
+                        mesh.uvs[2 * i + 1] = mesh.positions[3 * i + 2] - oz;
+                    }
+                }
+
                 long signature = (long)this.currentEntity << 32 ^ (long)texture * -7046029254386353131L ^ (long)flags << 8 ^ (long)mesh.vertexCount * -4417276706812531889L;
                 int ordinal = (Integer)this.customOrdinals.merge(signature, 1, Integer::sum) - 1;
                 MeshCache.Placed placed = this.meshes.place(signature * 31L + (long)ordinal, mesh);
@@ -388,7 +451,7 @@ public final class EntityCapture {
                 }
 
                 this.scratch.clear();
-                this.scratch.putInt(this.currentEntity).putInt(placed.shape()).putInt(texture).putInt(flags).putInt(placed.color()).putInt(655360);
+                this.scratch.putInt(this.currentEntity).putInt(placed.shape()).putInt(texture).putInt(this.withShadowFlags(flags)).putInt(placed.color()).putInt(655360);
                 (new Matrix4f()).translation(placed.ox(), placed.oy(), placed.oz()).get(this.matrix);
                 int[] var11 = COLUMN_MAJOR_4X3;
                 int var12 = var11.length;
@@ -436,29 +499,89 @@ public final class EntityCapture {
         return id;
     }
 
-    private void record(Model<?> model, Object state, PoseStack stack, RenderType renderType, int overlay, int color) {
-        if (this.records != null) {
+    private void record(Model<?> model, Object state, PoseStack stack, RenderType renderType, int overlay, int color, Object uvMapping) {
+        boolean mask = this.records != null && isWaterMask(renderType);
+        if (mask && REPORTED.add("mask-seen")) {
+            TmcgiUeBridgeClient.LOGGER.info("Water mask submitted (texture of the model before it: {})", this.lastModelTexture);
+        }
+
+        if (this.records != null && (!mask || this.lastModelTexture >= 0 && this.maskWaterSurface())) {
             try {
                 model.setupAnim(state);
-            } catch (RuntimeException var13) {
-                RuntimeException e = var13;
+            } catch (RuntimeException var16) {
+                RuntimeException e = var16;
                 if (FAILED.add(model.getClass())) {
                     TmcgiUeBridgeClient.LOGGER.warn("Model {} could not be posed", model.getClass().getName(), e);
                 }
             }
 
-            int texture = this.textureOf(renderType);
-            int flags = flagsOf(renderType);
+            int texture;
+            if (mask) {
+                texture = this.lastModelTexture;
+            } else if (uvMapping instanceof TextureAtlasSprite) {
+                TextureAtlasSprite sprite = (TextureAtlasSprite)uvMapping;
+                Identifier name = sprite.contents().name();
+                texture = this.textureOf(Identifier.fromNamespaceAndPath(name.getNamespace(), "textures/" + name.getPath() + ".png"));
+            } else {
+                texture = this.textureOf(renderType);
+            }
+
+            int flags = mask ? 0 : flagsOf(renderType);
+            if (!mask) {
+                this.lastModelTexture = texture;
+                this.lastModel = model;
+            } else if (this.lastModel == null) {
+                return;
+            }
+
             stack.pushPose();
+            if (mask) {
+                this.lowerMask(stack);
+                this.maskSources = new ArrayList();
+                collectCubes(this.lastModel.root(), this.maskSources);
+            }
 
             try {
                 this.walk(model.root(), stack, texture, flags, overlay, color);
             } finally {
+                this.maskSources = null;
                 ++this.currentLayer;
                 stack.popPose();
             }
 
         }
+    }
+
+    private boolean maskWaterSurface() {
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
+            return false;
+        } else {
+            double[] var2 = new double[]{0.0, 0.4, -0.4, 0.8};
+            int var3 = var2.length;
+
+            for(int var4 = 0; var4 < var3; ++var4) {
+                double offset = var2[var4];
+                BlockPos pos = BlockPos.containing(this.entityPosition.x, this.entityPosition.y + offset, this.entityPosition.z);
+                FluidState fluid = level.getFluidState(pos);
+                if (!fluid.isEmpty() && fluid.is(FluidTags.WATER)) {
+                    this.maskSurface = (double)((float)pos.getY() + fluid.getHeight(level, pos));
+                    return true;
+                }
+            }
+
+            if (REPORTED.add("mask-nowater")) {
+                TmcgiUeBridgeClient.LOGGER.info("Water mask: no water found at the entity ({}, {}, {})", new Object[]{this.entityPosition.x, this.entityPosition.y, this.entityPosition.z});
+            }
+
+            return false;
+        }
+    }
+
+    private void lowerMask(PoseStack stack) {
+        double surface = this.maskSurface;
+        double shift = surface + 0.01 - (this.entityPosition.y + 0.5625);
+        stack.last().pose().translateLocal(0.0F, (float)shift, 0.0F);
     }
 
     private void walk(ModelPart part, PoseStack stack, int texture, int flags, int overlay, int color) {
@@ -505,11 +628,58 @@ public final class EntityCapture {
         }
     }
 
+    private static void collectCubes(ModelPart part, List<ModelPart.Cube> into) {
+        try {
+            into.addAll((List)CUBES.get(part));
+            Iterator var5 = ((Map)CHILDREN.get(part)).values().iterator();
+
+            while(var5.hasNext()) {
+                ModelPart child = (ModelPart)var5.next();
+                collectCubes(child, into);
+            }
+
+        } catch (IllegalAccessException var4) {
+            IllegalAccessException e = var4;
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private ModelPart.Cube maskSource(ModelPart.Cube cube) {
+        Iterator var2 = this.maskSources.iterator();
+
+        ModelPart.Cube source;
+        do {
+            if (!var2.hasNext()) {
+                return null;
+            }
+
+            source = (ModelPart.Cube)var2.next();
+        } while(source.polygons.length != cube.polygons.length || !(Math.abs(source.maxX - source.minX - (cube.maxX - cube.minX)) < 0.001F) || !(Math.abs(source.maxY - source.minY - (cube.maxY - cube.minY)) < 0.001F) || !(Math.abs(source.maxZ - source.minZ - (cube.maxZ - cube.minZ)) < 0.001F));
+
+        return source;
+    }
+
     private void emit(ModelPart.Cube cube, PoseStack stack, int texture, int flags, int overlay, int color) {
-        Integer known = (Integer)this.cubeIds.get(cube);
-        int id = known != null ? known : this.defineCube(cube);
+        int id;
+        if (this.maskSources != null) {
+            ModelPart.Cube source = this.maskSource(cube);
+            if (source == null) {
+                if (REPORTED.add("mask-nosource")) {
+                    TmcgiUeBridgeClient.LOGGER.info("Water mask: the model before it has no cube of its size, it is left out");
+                }
+
+                return;
+            }
+
+            Integer known = (Integer)this.maskCubeIds.get(source);
+            id = known != null ? known : this.defineCube(cube, source);
+        } else {
+            Integer known = (Integer)this.cubeIds.get(cube);
+            id = known != null ? known : this.defineCube(cube, (ModelPart.Cube)null);
+        }
+
         this.scratch.clear();
-        this.scratch.putInt(this.currentEntity).putInt(id).putInt(texture).putInt(flags).putInt(color).putInt(overlay);
+        this.scratch.putInt(this.currentEntity).putInt(id).putInt(texture).putInt(this.withShadowFlags(flags)).putInt(color).putInt(overlay);
         float d02;
         if (this.currentLayer > 0) {
             float[] center = (float[])this.cubeCenters.get(id);
@@ -532,11 +702,11 @@ public final class EntityCapture {
             ++this.debugCube;
         }
 
-        int[] var14 = COLUMN_MAJOR_4X3;
-        int var15 = var14.length;
+        int[] var16 = COLUMN_MAJOR_4X3;
+        int var17 = var16.length;
 
-        for(int var16 = 0; var16 < var15; ++var16) {
-            int index = var14[var16];
+        for(int var18 = 0; var18 < var17; ++var18) {
+            int index = var16[var18];
             this.scratch.putFloat(this.matrix[index]);
         }
 
@@ -544,13 +714,59 @@ public final class EntityCapture {
         ++this.recordCount;
     }
 
-    private static Method bob(String name) {
-        try {
-            Method method = GameRenderer.class.getDeclaredMethod(name, CameraRenderState.class, PoseStack.class);
-            method.setAccessible(true);
-            return method;
-        } catch (ReflectiveOperationException var2) {
-            return null;
+    private void recordBlockEntities(Minecraft minecraft, GameRenderer renderer, Vec3 cameraPosition, double rangeSquared) {
+        ClientLevel level = minecraft.level;
+        if (level != null) {
+            LevelRenderState levelState = renderer.gameRenderState().levelRenderState;
+            BlockEntityRenderDispatcher dispatcher = minecraft.getBlockEntityRenderDispatcher();
+            float partialTick = minecraft.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+            int centerX = (int)Math.floor(cameraPosition.x) >> 4;
+            int centerZ = (int)Math.floor(cameraPosition.z) >> 4;
+            int chunkRange = (int)Math.ceil(6.0) + 1;
+
+            for(int cx = centerX - chunkRange; cx <= centerX + chunkRange; ++cx) {
+                for(int cz = centerZ - chunkRange; cz <= centerZ + chunkRange; ++cz) {
+                    LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false);
+                    if (chunk != null && !chunk.getBlockEntities().isEmpty()) {
+                        Iterator var16 = chunk.getBlockEntities().values().iterator();
+
+                        while(var16.hasNext()) {
+                            BlockEntity blockEntity = (BlockEntity)var16.next();
+                            BlockPos pos = blockEntity.getBlockPos();
+                            double dx = (double)pos.getX() + 0.5 - cameraPosition.x;
+                            double dy = (double)pos.getY() + 0.5 - cameraPosition.y;
+                            double dz = (double)pos.getZ() + 0.5 - cameraPosition.z;
+                            if (!blockEntity.isRemoved() && !(dx * dx + dy * dy + dz * dz > rangeSquared)) {
+                                try {
+                                    BlockEntityRenderState state = dispatcher.tryExtractRenderState(blockEntity, partialTick, (ModelFeatureRenderer.CrumblingOverlay)null, false);
+                                    if (state == null) {
+                                        state = dispatcher.tryExtractRenderState(blockEntity, partialTick, (ModelFeatureRenderer.CrumblingOverlay)null, true);
+                                    }
+
+                                    if (state != null) {
+                                        this.currentEntity = 1073741824 | (int)(pos.asLong() * -7046029254386353131L >>> 34);
+                                        this.currentLayer = 0;
+                                        this.lastModelTexture = -1;
+                                        this.lastModel = null;
+                                        PoseStack poseStack = new PoseStack();
+                                        poseStack.translate((double)pos.getX() - cameraPosition.x, (double)pos.getY() - cameraPosition.y, (double)pos.getZ() - cameraPosition.z);
+                                        dispatcher.submit(state, poseStack, this.collector, levelState.cameraRenderState);
+                                        if (REPORTED.add("blockEntity " + String.valueOf(blockEntity.getType()))) {
+                                            TmcgiUeBridgeClient.LOGGER.info("Block entity {} recorded", blockEntity.getType());
+                                        }
+                                    }
+                                } catch (RuntimeException var27) {
+                                    RuntimeException e = var27;
+                                    if (FAILED.add(blockEntity.getType())) {
+                                        TmcgiUeBridgeClient.LOGGER.warn("Block entity {} could not be recorded", blockEntity.getType(), e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
         }
     }
 
@@ -563,18 +779,6 @@ public final class EntityCapture {
             PoseStack poseStack = new PoseStack();
             poseStack.pushPose();
             poseStack.mulPose(cameraState.viewRotationMatrix.invert(new Matrix4f()));
-
-            try {
-                if (BOB_HURT != null) {
-                    BOB_HURT.invoke(renderer, cameraState, poseStack);
-                }
-
-                if (options.bobView && BOB_VIEW != null) {
-                    BOB_VIEW.invoke(renderer, cameraState, poseStack);
-                }
-            } catch (ReflectiveOperationException var9) {
-            }
-
             this.currentEntity = -2147483641;
             this.currentLayer = 0;
             renderer.firstPersonHandsAndItemsRenderer.submitHandsWithItems(cameraState.cameraEntityPartialTicks, poseStack, this.collector, playerState, playerState.firstPersonHandsAndItems);
@@ -599,7 +803,7 @@ public final class EntityCapture {
             ItemPart part = (ItemPart)var5.next();
             int color = part.tint() >= 0 && tints != null && part.tint() < tints.length ? tints[part.tint()] : -1;
             this.scratch.clear();
-            this.scratch.putInt(this.currentEntity).putInt(part.cube()).putInt(part.texture()).putInt(part.flags()).putInt(color).putInt(overlay);
+            this.scratch.putInt(this.currentEntity).putInt(part.cube()).putInt(part.texture()).putInt(this.withShadowFlags(part.flags())).putInt(color).putInt(overlay);
             stack.last().pose().get(this.matrix);
             int[] var8 = COLUMN_MAJOR_4X3;
             int var9 = var8.length;
@@ -810,7 +1014,7 @@ public final class EntityCapture {
                 int cube = this.flameCube(which, strip.frameAt(this.gameTicks), strip.frames, flip);
                 Matrix4f placed = (new Matrix4f(m)).translate(0.0F, -yo, zo).scale(r * 2.0F, 1.0F, 1.0F);
                 this.scratch.clear();
-                this.scratch.putInt(this.currentEntity).putInt(cube).putInt(strip.texture).putInt(2).putInt(-1).putInt(655360);
+                this.scratch.putInt(this.currentEntity).putInt(cube).putInt(strip.texture).putInt(this.withShadowFlags(2)).putInt(-1).putInt(655360);
                 placed.get(this.matrix);
                 int[] var16 = COLUMN_MAJOR_4X3;
                 int var17 = var16.length;
@@ -868,7 +1072,7 @@ public final class EntityCapture {
         }
     }
 
-    private int defineCube(ModelPart.Cube cube) {
+    private int defineCube(ModelPart.Cube cube, ModelPart.Cube uvSource) {
         ModelPart.Polygon[] polygons = cube.polygons;
         ByteBuffer buffer = ByteBuffer.allocate(11 + polygons.length * 92).order(ByteOrder.LITTLE_ENDIAN);
         int id = this.cubeFrames.size();
@@ -876,22 +1080,16 @@ public final class EntityCapture {
         buffer.putInt(id).putShort((short)polygons.length);
         float[] low = new float[]{Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE};
         float[] high = new float[]{-3.4028235E38F, -3.4028235E38F, -3.4028235E38F};
-        ModelPart.Polygon[] var7 = polygons;
-        int var8 = polygons.length;
+        ModelPart.Polygon[] var8 = polygons;
+        int var9 = polygons.length;
 
-        int var9;
-        ModelPart.Polygon polygon;
-        ModelPart.Vertex[] var11;
-        int var12;
-        int var13;
-        ModelPart.Vertex vertex;
-        for(var9 = 0; var9 < var8; ++var9) {
-            polygon = var7[var9];
-            var11 = polygon.vertices();
-            var12 = var11.length;
+        for(int var10 = 0; var10 < var9; ++var10) {
+            ModelPart.Polygon polygon = var8[var10];
+            ModelPart.Vertex[] var12 = polygon.vertices();
+            int var13 = var12.length;
 
-            for(var13 = 0; var13 < var12; ++var13) {
-                vertex = var11[var13];
+            for(int var14 = 0; var14 < var13; ++var14) {
+                ModelPart.Vertex vertex = var12[var14];
                 low[0] = Math.min(low[0], vertex.worldX());
                 low[1] = Math.min(low[1], vertex.worldY());
                 low[2] = Math.min(low[2], vertex.worldZ());
@@ -902,24 +1100,27 @@ public final class EntityCapture {
         }
 
         this.cubeCenters.add(new float[]{(low[0] + high[0]) / 2.0F, (low[1] + high[1]) / 2.0F, (low[2] + high[2]) / 2.0F});
-        var7 = polygons;
-        var8 = polygons.length;
 
-        for(var9 = 0; var9 < var8; ++var9) {
-            polygon = var7[var9];
+        for(int p = 0; p < polygons.length; ++p) {
+            ModelPart.Polygon polygon = polygons[p];
             buffer.putFloat(polygon.normal().x()).putFloat(polygon.normal().y()).putFloat(polygon.normal().z());
-            var11 = polygon.vertices();
-            var12 = var11.length;
+            ModelPart.Vertex[] vertices = polygon.vertices();
 
-            for(var13 = 0; var13 < var12; ++var13) {
-                vertex = var11[var13];
+            for(int v = 0; v < vertices.length; ++v) {
+                ModelPart.Vertex vertex = vertices[v];
+                ModelPart.Vertex uv = uvSource != null ? uvSource.polygons[p].vertices()[v] : vertex;
                 buffer.putFloat(vertex.worldX()).putFloat(vertex.worldY()).putFloat(vertex.worldZ());
-                buffer.putFloat(vertex.u()).putFloat(vertex.v());
+                buffer.putFloat(Float.isFinite(uv.u()) ? uv.u() : 0.0F).putFloat(Float.isFinite(uv.v()) ? uv.v() : 0.0F);
             }
         }
 
         this.cubeFrames.add(buffer.array());
-        this.cubeIds.put(cube, id);
+        if (uvSource != null) {
+            this.maskCubeIds.put(uvSource, id);
+        } else {
+            this.cubeIds.put(cube, id);
+        }
+
         return id;
     }
 
@@ -966,12 +1167,46 @@ public final class EntityCapture {
                     }
 
                     this.scratch.clear();
-                    this.scratch.putInt(this.currentEntity).putInt(this.labelCube).putInt(texture).putInt(2).putInt(-1).putInt(655360);
+                    this.scratch.putInt(this.currentEntity).putInt(this.labelCube).putInt(texture).putInt(this.withShadowFlags(2)).putInt(-1).putInt(655360);
                     int[] var12 = COLUMN_MAJOR_4X3;
                     int var13 = var12.length;
 
                     for(int var14 = 0; var14 < var13; ++var14) {
                         int index = var12[var14];
+                        this.scratch.putFloat(this.matrix[index]);
+                    }
+
+                    this.records.write(this.scratch.array(), 0, this.scratch.position());
+                    ++this.recordCount;
+                }
+            }
+        }
+    }
+
+    private void recordText(PoseStack stack, float x, float y, FormattedCharSequence text, int color, int outline) {
+        if (this.records != null) {
+            List<LabelExport.Segment> segments = LabelExport.segments(text, color);
+            if (!segments.isEmpty()) {
+                String var10000 = Integer.toHexString(outline);
+                String key = var10000 + "\u0002" + LabelExport.keyOf(segments);
+                LabelExport.Label label = this.labels.get(key, segments, outline);
+                Integer texture = (Integer)this.labelTextures.get(key);
+                if (label != null && texture != null) {
+                    if (this.labelCube < 0) {
+                        this.labelCube = this.unitQuadCube();
+                    }
+
+                    float width = (float)label.width() / 4.0F;
+                    float height = (float)label.height() / 4.0F;
+                    float middle = x + (float)Minecraft.getInstance().font.width(text) / 2.0F;
+                    this.layerMatrix.set(stack.last().pose()).translate(middle - width / 2.0F, y + 7.0F - (float)label.baseline() / 4.0F, 0.0F).scale(width, height, 1.0F).get(this.matrix);
+                    this.scratch.clear();
+                    this.scratch.putInt(this.currentEntity).putInt(this.labelCube).putInt(texture).putInt(this.withShadowFlags(outline != 0 ? 2 : 0)).putInt(-1).putInt(655360);
+                    int[] var14 = COLUMN_MAJOR_4X3;
+                    int var15 = var14.length;
+
+                    for(int var16 = 0; var16 < var15; ++var16) {
+                        int index = var14[var16];
                         this.scratch.putFloat(this.matrix[index]);
                     }
 
@@ -1040,26 +1275,82 @@ public final class EntityCapture {
         return buffer.array();
     }
 
+    private static Method findWriteToChannel() {
+        try {
+            Method method = NativeImage.class.getDeclaredMethod("writeToChannel", WritableByteChannel.class);
+            method.setAccessible(true);
+            return method;
+        } catch (RuntimeException | ReflectiveOperationException var1) {
+            return null;
+        }
+    }
+
+    static byte[] encodePng(NativeImage image) throws IOException {
+        if (WRITE_TO_CHANNEL != null) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream(65536);
+
+            try {
+                label111: {
+                    WritableByteChannel channel = Channels.newChannel(bytes);
+
+                    byte[] var3;
+                    label103: {
+                        try {
+                            if (Boolean.TRUE.equals(WRITE_TO_CHANNEL.invoke(image, channel))) {
+                                var3 = bytes.toByteArray();
+                                break label103;
+                            }
+                        } catch (Throwable var12) {
+                            if (channel != null) {
+                                try {
+                                    channel.close();
+                                } catch (Throwable var11) {
+                                    var12.addSuppressed(var11);
+                                }
+                            }
+
+                            throw var12;
+                        }
+
+                        if (channel != null) {
+                            channel.close();
+                        }
+                        break label111;
+                    }
+
+                    if (channel != null) {
+                        channel.close();
+                    }
+
+                    return var3;
+                }
+            } catch (ReflectiveOperationException var13) {
+            }
+        }
+
+        Path temp = Files.createTempFile("tmcgi-image", ".png");
+
+        byte[] var15;
+        try {
+            image.writeToFile(temp);
+            var15 = Files.readAllBytes(temp);
+        } finally {
+            Files.deleteIfExists(temp);
+        }
+
+        return var15;
+    }
+
     private static byte[] readDynamicTexture(Identifier location) {
         try {
             Object texture = Minecraft.getInstance().getTextureManager().getTexture(location);
             if (texture instanceof DynamicTexture dynamic) {
                 if (dynamic.getPixels() != null) {
-                    Path temp = Files.createTempFile("tmcgi-skin", ".png");
-
-                    byte[] var4;
-                    try {
-                        dynamic.getPixels().writeToFile(temp);
-                        var4 = Files.readAllBytes(temp);
-                    } finally {
-                        Files.deleteIfExists(temp);
-                    }
-
-                    return var4;
+                    return encodePng(dynamic.getPixels());
                 }
             }
-        } catch (Exception var9) {
-            Exception e = var9;
+        } catch (Exception var3) {
+            Exception e = var3;
             TmcgiUeBridgeClient.LOGGER.warn("The run-time texture {} could not be read", location, e);
         }
 
@@ -1101,12 +1392,16 @@ public final class EntityCapture {
     }
 
     private static Identifier textureLocation(RenderType renderType) {
+        return textureLocation(renderType, "Sampler0");
+    }
+
+    private static Identifier textureLocation(RenderType renderType, String sampler) {
         try {
             Object setup = RENDER_TYPE_STATE.get(renderType);
             Field texturesField = setup.getClass().getDeclaredField("textures");
             texturesField.setAccessible(true);
             Map<?, ?> textures = (Map)texturesField.get(setup);
-            Object binding = textures.get("Sampler0");
+            Object binding = textures.get(sampler);
             if (binding == null) {
                 return null;
             } else {
@@ -1114,8 +1409,37 @@ public final class EntityCapture {
                 location.setAccessible(true);
                 return (Identifier)location.invoke(binding);
             }
-        } catch (ReflectiveOperationException var6) {
+        } catch (ReflectiveOperationException var7) {
             return null;
+        }
+    }
+
+    private int withShadowFlags(int flags) {
+        if (this.shadowOnly) {
+            flags |= 256;
+        }
+
+        if (this.currentEntity == -2147483641) {
+            flags |= 512;
+        }
+
+        return flags;
+    }
+
+    private static boolean isEndPortal(RenderType renderType) {
+        try {
+            String name = String.valueOf(RENDER_TYPE_NAME.get(renderType));
+            return name.contains("end_portal") || name.contains("end_gateway");
+        } catch (IllegalAccessException var2) {
+            return false;
+        }
+    }
+
+    private static boolean isWaterMask(RenderType renderType) {
+        try {
+            return String.valueOf(RENDER_TYPE_NAME.get(renderType)).contains("water_mask");
+        } catch (IllegalAccessException var2) {
+            return false;
         }
     }
 
@@ -1142,6 +1466,7 @@ public final class EntityCapture {
     static {
         CULLS = new Direction[]{null, Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST};
         DEBUG = System.getenv("TMCGI_DEBUG_ENTITY") != null;
+        WRITE_TO_CHANNEL = findWriteToChannel();
     }
 
     private static final class FlameStrip {

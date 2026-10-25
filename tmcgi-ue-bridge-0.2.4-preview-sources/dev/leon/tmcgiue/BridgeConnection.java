@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class BridgeConnection {
@@ -31,10 +32,14 @@ final class BridgeConnection {
     private final AtomicReference<byte[]> latestEntities = new AtomicReference();
     private final AtomicReference<byte[]> latestParticles = new AtomicReference();
     private final ConcurrentLinkedQueue<byte[]> urgent = new ConcurrentLinkedQueue();
+    private final AtomicLong queuedBytes = new AtomicLong();
+    private static final long MAX_QUEUED_BYTES = 536870912L;
     private volatile int rendererWidth;
     private volatile int rendererHeight;
     private volatile int generation;
     private volatile int overflows;
+    private volatile int epoch;
+    private volatile boolean behind;
     private volatile boolean connected;
     private volatile boolean stopping;
     private Thread thread;
@@ -67,14 +72,61 @@ final class BridgeConnection {
     }
 
     void send(byte[] frame) {
-        if (this.connected) {
+        if (this.connected && !this.behind) {
             if (!this.queue.offer(frame)) {
-                this.queue.clear();
-                ++this.overflows;
-                this.resync.set(true);
+                this.overflow();
+            } else if (this.queuedBytes.addAndGet((long)frame.length) > 536870912L) {
+                this.overflow();
             }
 
         }
+    }
+
+    private synchronized void overflow() {
+        this.dropQueued();
+        if (!this.behind) {
+            this.behind = true;
+            TmcgiUeBridgeClient.LOGGER.warn("The renderer fell behind: the queued frames were dropped, everything is sent again once it reads again");
+        }
+
+    }
+
+    private synchronized void caughtUp() {
+        this.behind = false;
+        ++this.overflows;
+        ++this.epoch;
+        this.resync.set(true);
+        TmcgiUeBridgeClient.LOGGER.info("The renderer reads again ({} overflows so far): everything is sent again", this.overflows);
+    }
+
+    private void dropQueued() {
+        byte[] dropped;
+        while((dropped = (byte[])this.queue.poll()) != null) {
+            this.queuedBytes.addAndGet((long)(-dropped.length));
+        }
+
+        while((dropped = (byte[])this.urgent.poll()) != null) {
+            this.queuedBytes.addAndGet((long)(-dropped.length));
+        }
+
+    }
+
+    private byte[] pollUrgent() {
+        byte[] frame = (byte[])this.urgent.poll();
+        if (frame != null) {
+            this.queuedBytes.addAndGet((long)(-frame.length));
+        }
+
+        return frame;
+    }
+
+    private byte[] pollQueue() {
+        byte[] frame = (byte[])this.queue.poll();
+        if (frame != null) {
+            this.queuedBytes.addAndGet((long)(-frame.length));
+        }
+
+        return frame;
     }
 
     void sendUi(byte[] frame) {
@@ -98,6 +150,10 @@ final class BridgeConnection {
 
     int overflows() {
         return this.overflows;
+    }
+
+    int epoch() {
+        return this.epoch;
     }
 
     private void readLoop(Socket socket) {
@@ -136,8 +192,11 @@ final class BridgeConnection {
     }
 
     void sendUrgent(byte[] frame) {
-        if (this.connected) {
+        if (this.connected && !this.behind) {
             this.urgent.add(frame);
+            if (this.queuedBytes.addAndGet((long)frame.length) > 536870912L) {
+                this.overflow();
+            }
         }
 
     }
@@ -171,7 +230,7 @@ final class BridgeConnection {
         byte[] small = (byte[])this.urgent.peek();
         if (pose != null || ui != null || entities != null || particles != null || small != null) {
             while(true) {
-                if ((small = (byte[])this.urgent.poll()) == null) {
+                if ((small = this.pollUrgent()) == null) {
                     if (entities != null) {
                         out.write(entities);
                     }
@@ -200,7 +259,7 @@ final class BridgeConnection {
 
     private void run() {
         while(!this.stopping) {
-            label137: {
+            label156: {
                 try {
                     Socket socket = new Socket();
 
@@ -210,15 +269,16 @@ final class BridgeConnection {
                         OutputStream out = new BufferedOutputStream(socket.getOutputStream(), 65536);
                         out.write(BridgeProtocol.hello("minecraft 26.3"));
                         out.flush();
-                        this.queue.clear();
+                        this.dropQueued();
+                        this.behind = false;
                         this.latestPose.set((Object)null);
                         this.latestUi.set((Object)null);
                         this.latestEntities.set((Object)null);
                         this.latestParticles.set((Object)null);
-                        this.urgent.clear();
                         this.rendererWidth = 0;
                         this.rendererHeight = 0;
                         ++this.generation;
+                        ++this.epoch;
                         Thread reader = new Thread(() -> {
                             this.readLoop(socket);
                         }, "TMCGI-UE-Bridge-Read");
@@ -226,23 +286,32 @@ final class BridgeConnection {
                         reader.start();
                         this.connected = true;
                         TmcgiSettings.onConnected();
-                        this.urgent.add(TmcgiSettings.frame());
+                        this.sendUrgent(TmcgiSettings.frame());
                         this.resync.set(true);
                         TmcgiUeBridgeClient.LOGGER.info("Connected to the TMCGI renderer at {}:{}", this.host, this.port);
 
                         while(!this.stopping) {
-                            for(byte[] frame = (byte[])this.queue.poll(2L, TimeUnit.MILLISECONDS); frame != null; frame = (byte[])this.queue.poll()) {
+                            byte[] frame = (byte[])this.queue.poll(2L, TimeUnit.MILLISECONDS);
+                            if (frame != null) {
+                                this.queuedBytes.addAndGet((long)(-frame.length));
+                            }
+
+                            while(frame != null) {
                                 byte[] ahead;
-                                while((ahead = (byte[])this.urgent.poll()) != null) {
+                                while((ahead = this.pollUrgent()) != null) {
                                     out.write(ahead);
                                 }
 
                                 out.write(frame);
                                 this.writeLatest(out);
+                                frame = this.pollQueue();
                             }
 
                             this.writeLatest(out);
                             out.flush();
+                            if (this.behind && this.queue.isEmpty() && this.urgent.isEmpty()) {
+                                this.caughtUp();
+                            }
                         }
                     } catch (Throwable var15) {
                         try {
@@ -255,13 +324,13 @@ final class BridgeConnection {
                     }
 
                     socket.close();
-                    break label137;
+                    break label156;
                 } catch (IOException var16) {
                     IOException e = var16;
                     if (this.connected) {
                         TmcgiUeBridgeClient.LOGGER.info("The TMCGI renderer connection ended: {}", e.toString());
                     }
-                    break label137;
+                    break label156;
                 } catch (InterruptedException var17) {
                 } finally {
                     this.connected = false;

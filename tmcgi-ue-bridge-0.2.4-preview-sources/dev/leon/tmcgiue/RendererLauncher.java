@@ -260,8 +260,8 @@ final class RendererLauncher {
                         if (files != null) {
                             try {
                                 files.close();
-                            } catch (Throwable var11) {
-                                var12.addSuppressed(var11);
+                            } catch (Throwable var10) {
+                                var12.addSuppressed(var10);
                             }
                         }
 
@@ -306,8 +306,8 @@ final class RendererLauncher {
                                 if (files != null) {
                                     try {
                                         files.close();
-                                    } catch (Throwable var10) {
-                                        var13.addSuppressed(var10);
+                                    } catch (Throwable var11) {
+                                        var13.addSuppressed(var11);
                                     }
                                 }
 

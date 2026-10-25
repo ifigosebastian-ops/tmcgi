@@ -45,6 +45,7 @@ final class BridgeProtocol {
     static final int LOD_TILE = 25;
     static final int LOD_VIEW = 26;
     static final int LOD_TEXTURES = 27;
+    static final int DYNAMIC_LIGHTS = 28;
     static final int WINDOW = 128;
     static final int STATUS = 129;
 
@@ -111,6 +112,18 @@ final class BridgeProtocol {
         byte[] payload = body.toByteArray();
         ByteBuffer buffer = frame(22, payload.length);
         buffer.put(payload);
+        return buffer.array();
+    }
+
+    static byte[] dynamicLights(int[] ids, double[] positions, int[] levels, int[] colors, int count) {
+        ByteBuffer buffer = frame(28, 2 + count * 33);
+        buffer.putShort((short)count);
+
+        for(int i = 0; i < count; ++i) {
+            int color = colors[i];
+            buffer.putInt(ids[i]).putDouble(positions[i * 3]).putDouble(positions[i * 3 + 1]).putDouble(positions[i * 3 + 2]).put((byte)levels[i]).put((byte)(color >= 0 ? 1 : 0)).put((byte)(color >> 16)).put((byte)(color >> 8)).put((byte)color);
+        }
+
         return buffer.array();
     }
 
@@ -183,7 +196,7 @@ final class BridgeProtocol {
         }
 
         quadCount = Math.min(quads.size(), 65535);
-        size += 2 + quadCount * 85;
+        size += 2 + quadCount * 89;
         ByteBuffer buffer = frame(19, size);
         buffer.putShort((short)name.length).put(name);
         buffer.put((byte)occlusion);
@@ -216,7 +229,7 @@ final class BridgeProtocol {
 
         for(int i = 0; i < quadCount; ++i) {
             quad = (float[])quads.get(i);
-            buffer.put((byte)((int)quad[0])).put((byte)((int)quad[1])).put((byte)((int)quad[2])).putShort((short)((int)quad[3]));
+            buffer.put((byte)((int)quad[0])).put((byte)((int)quad[1])).put((byte)((int)quad[2])).putShort((short)((int)quad[3])).putInt(quad[24] != 0.0F ? -16777216 | (int)quad[25] : 0);
 
             for(j = 4; j < 24; ++j) {
                 buffer.putFloat(quad[j]);
@@ -345,25 +358,33 @@ final class BridgeProtocol {
         return buffer.array();
     }
 
-    static byte[] pose(double x, double y, double z, float forwardX, float forwardY, float forwardZ, float upX, float upY, float upZ, float fov, long clock, int frame) {
-        ByteBuffer buffer = frame(4, 64);
+    static byte[] pose(double x, double y, double z, float forwardX, float forwardY, float forwardZ, float upX, float upY, float upZ, float fov, long clock, int frame, float[] bobbing) {
+        ByteBuffer buffer = frame(4, 100);
         buffer.putDouble(x).putDouble(y).putDouble(z);
         buffer.putFloat(forwardX).putFloat(forwardY).putFloat(forwardZ);
         buffer.putFloat(upX).putFloat(upY).putFloat(upZ);
         buffer.putFloat(fov);
         buffer.putLong(clock);
         buffer.putInt(frame);
+        float[] var18 = bobbing;
+        int var19 = bobbing.length;
+
+        for(int var20 = 0; var20 < var19; ++var20) {
+            float value = var18[var20];
+            buffer.putFloat(value);
+        }
+
         return buffer.array();
     }
 
-    static byte[] section(int chunkX, int sectionY, int chunkZ, int revision, List<String> palette, short[] indices) {
+    static byte[] section(int chunkX, int sectionY, int chunkZ, int revision, List<String> palette, short[] indices, int[] worldTints) {
         ByteBuffer raw = ByteBuffer.allocate(indices.length * 2).order(ByteOrder.LITTLE_ENDIAN);
-        short[] var7 = indices;
-        int var8 = indices.length;
+        short[] var8 = indices;
+        int var9 = indices.length;
 
         int compressedSize;
-        for(compressedSize = 0; compressedSize < var8; ++compressedSize) {
-            short index = var7[compressedSize];
+        for(compressedSize = 0; compressedSize < var9; ++compressedSize) {
+            short index = var8[compressedSize];
             raw.putShort(index);
         }
 
@@ -376,25 +397,51 @@ final class BridgeProtocol {
         byte[][] names = new byte[palette.size()][];
         int paletteBytes = 0;
 
-        for(int i = 0; i < names.length; ++i) {
-            names[i] = ((String)palette.get(i)).getBytes(StandardCharsets.UTF_8);
-            paletteBytes += 2 + names[i].length;
+        int tintCount;
+        for(tintCount = 0; tintCount < names.length; ++tintCount) {
+            names[tintCount] = ((String)palette.get(tintCount)).getBytes(StandardCharsets.UTF_8);
+            paletteBytes += 2 + names[tintCount].length;
         }
 
-        ByteBuffer buffer = frame(2, 18 + paletteBytes + 4 + compressedSize);
+        tintCount = worldTints.length / 2;
+        byte[] tintsCompressed = new byte[0];
+        int tintsSize = 0;
+        ByteBuffer buffer;
+        int key;
+        int color;
+        if (tintCount > 0) {
+            buffer = ByteBuffer.allocate(tintCount * 6).order(ByteOrder.LITTLE_ENDIAN);
+
+            for(int i = 0; i < tintCount; ++i) {
+                key = worldTints[i * 2];
+                color = worldTints[i * 2 + 1];
+                buffer.putShort((short)(key >>> 8)).put((byte)key).put((byte)(color >> 16)).put((byte)(color >> 8)).put((byte)color);
+            }
+
+            Deflater tintDeflater = new Deflater(1);
+            tintDeflater.setInput(buffer.array());
+            tintDeflater.finish();
+            tintsCompressed = new byte[buffer.capacity() + 64];
+            tintsSize = tintDeflater.deflate(tintsCompressed);
+            tintDeflater.end();
+        }
+
+        buffer = frame(2, 18 + paletteBytes + 4 + compressedSize + 8 + tintsSize);
         buffer.putInt(chunkX).putInt(sectionY).putInt(chunkZ).putInt(revision);
         buffer.putShort((short)names.length);
-        byte[][] var13 = names;
-        int var14 = names.length;
+        byte[][] var25 = names;
+        key = names.length;
 
-        for(int var15 = 0; var15 < var14; ++var15) {
-            byte[] name = var13[var15];
+        for(color = 0; color < key; ++color) {
+            byte[] name = var25[color];
             buffer.putShort((short)name.length);
             buffer.put(name);
         }
 
         buffer.putInt(compressedSize);
         buffer.put(compressed, 0, compressedSize);
+        buffer.putInt(tintCount).putInt(tintsSize);
+        buffer.put(tintsCompressed, 0, tintsSize);
         return buffer.array();
     }
 }

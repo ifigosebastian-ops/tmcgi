@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "tmcgi_ue_bridge",
-  "version": "0.2.3-alpha",
+  "version": "0.2.4-preview",
   "name": "TMCGI UE Bridge",
   "description": "Sends the loaded world and the camera to the TMCGI Unreal Engine renderer over a local TCP connection.",
   "authors": ["Leon Li"],

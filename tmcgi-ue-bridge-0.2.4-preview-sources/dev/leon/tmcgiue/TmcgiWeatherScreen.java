@@ -8,11 +8,10 @@ package dev.leon.tmcgiue;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.options.OptionsSubScreen;
-import net.minecraft.network.chat.Component;
 
 final class TmcgiWeatherScreen extends OptionsSubScreen {
     TmcgiWeatherScreen(Screen lastScreen) {
-        super(lastScreen, Minecraft.getInstance().options, Component.literal("Weather Settings"));
+        super(lastScreen, Minecraft.getInstance().options, TmcgiSettingsScreen.t("screen.weather"));
     }
 
     public void onClose() {
@@ -26,12 +25,10 @@ final class TmcgiWeatherScreen extends OptionsSubScreen {
     }
 
     protected void addOptions() {
-        this.list.addBig(TmcgiSettingsScreen.levels("Volumetric Cloud Quality", TmcgiSettings.CLOUD_NAMES, TmcgiSettings.CLOUD_MODES, TmcgiSettings.cloudMode, (v) -> {
+        this.list.addBig(TmcgiSettingsScreen.levels("option.clouds", TmcgiSettingsScreen.texts(TmcgiSettings.CLOUD_NAMES), TmcgiSettings.CLOUD_MODES, TmcgiSettings.cloudMode, (v) -> {
             TmcgiSettings.cloudMode = v;
         }));
-        this.list.addBig(TmcgiSettingsScreen.toggle("Volumetric Fog", TmcgiSettings.volumetricFog, (v) -> {
-            return v ? "On" : "Off";
-        }, (v) -> {
+        this.list.addBig(TmcgiSettingsScreen.toggle("option.volumetricFog", TmcgiSettings.volumetricFog, (v) -> {
             TmcgiSettings.volumetricFog = v;
         }));
     }

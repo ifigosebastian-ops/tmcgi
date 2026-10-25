@@ -28,6 +28,7 @@ import javax.imageio.ImageIO;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
 import net.minecraft.network.chat.TextColor;
+import net.minecraft.util.FormattedCharSequence;
 
 final class LabelExport {
     static final int SCALE = 4;
@@ -41,8 +42,13 @@ final class LabelExport {
     private final Set<String> started = ConcurrentHashMap.newKeySet();
     private final Queue<Label> finished = new ConcurrentLinkedQueue();
     private final Map<String, Label> ready = new ConcurrentHashMap();
+    static final int NAME_TAG_OUTLINE = -939524096;
 
     LabelExport() {
+    }
+
+    void close() {
+        this.worker.shutdownNow();
     }
 
     static List<Segment> segments(Component text) {
@@ -58,6 +64,35 @@ final class LabelExport {
         return out;
     }
 
+    static List<Segment> segments(FormattedCharSequence text, int defaultColor) {
+        List<Segment> out = new ArrayList();
+        StringBuilder run = new StringBuilder();
+        Style[] runStyle = new Style[]{null};
+        text.accept((index, style, codepoint) -> {
+            if (runStyle[0] != null && !runStyle[0].equals(style)) {
+                out.add(segment(run.toString(), runStyle[0], defaultColor));
+                run.setLength(0);
+            }
+
+            runStyle[0] = style;
+            run.appendCodePoint(codepoint);
+            return true;
+        });
+        if (run.length() > 0) {
+            out.add(segment(run.toString(), runStyle[0], defaultColor));
+        }
+
+        out.removeIf((segment) -> {
+            return segment.text.isBlank();
+        });
+        return out;
+    }
+
+    private static Segment segment(String text, Style style, int defaultColor) {
+        TextColor color = style.getColor();
+        return new Segment(text, color != null ? color.getValue() : defaultColor & 16777215, style.isBold(), style.isItalic(), style.isUnderlined(), style.isStrikethrough());
+    }
+
     static String keyOf(List<Segment> segments) {
         StringBuilder key = new StringBuilder();
         Iterator var2 = segments.iterator();
@@ -71,6 +106,10 @@ final class LabelExport {
     }
 
     Label get(String key, List<Segment> segments) {
+        return this.get(key, segments, -939524096);
+    }
+
+    Label get(String key, List<Segment> segments, int outline) {
         Label label = (Label)this.ready.get(key);
         if (label != null) {
             return label;
@@ -78,12 +117,12 @@ final class LabelExport {
             if (this.ready.size() + this.started.size() < 1500 && this.started.add(key)) {
                 this.worker.execute(() -> {
                     try {
-                        Label drawn = draw(key, segments);
+                        Label drawn = draw(key, segments, outline);
                         if (drawn != null) {
                             this.finished.add(drawn);
                         }
-                    } catch (LinkageError | Exception var4) {
-                        Throwable e = var4;
+                    } catch (LinkageError | Exception var5) {
+                        Throwable e = var5;
                         TmcgiUeBridgeClient.LOGGER.warn("A name tag could not be drawn", e);
                     }
 
@@ -110,7 +149,7 @@ final class LabelExport {
         return (Label)this.ready.get(key);
     }
 
-    private static Label draw(String key, List<Segment> segments) throws IOException {
+    private static Label draw(String key, List<Segment> segments, int outline) throws IOException {
         Font base = new Font("SansSerif", 0, 32);
         BufferedImage probe = new BufferedImage(1, 1, 2);
         Graphics2D measure = probe.createGraphics();
@@ -123,8 +162,8 @@ final class LabelExport {
 
         FontMetrics metrics;
         int x;
-        for(Iterator var10 = segments.iterator(); var10.hasNext(); descent = Math.max(descent, metrics.getDescent())) {
-            Segment segment = (Segment)var10.next();
+        for(Iterator var11 = segments.iterator(); var11.hasNext(); descent = Math.max(descent, metrics.getDescent())) {
+            Segment segment = (Segment)var11.next();
             Font font = base.deriveFont((segment.bold ? 1 : 0) | (segment.italic ? 2 : 0));
             metrics = measure.getFontMetrics(font);
             fonts.add(font);
@@ -149,30 +188,32 @@ final class LabelExport {
             for(int i = 0; i < segments.size(); ++i) {
                 Segment segment = (Segment)segments.get(i);
                 g.setFont((Font)fonts.get(i));
-                g.setColor(new Color(0, 0, 0, 200));
-                int step = Math.max(1, 2);
+                int step;
+                if (outline >>> 24 != 0) {
+                    g.setColor(new Color(outline, true));
+                    step = Math.max(1, 2);
 
-                int w;
-                for(w = -step; w <= step; w += step) {
-                    for(int dy = -step; dy <= step; dy += step) {
-                        if (w != 0 || dy != 0) {
-                            g.drawString(segment.text, x + w, baseline + dy);
+                    for(int dx = -step; dx <= step; dx += step) {
+                        for(int dy = -step; dy <= step; dy += step) {
+                            if (dx != 0 || dy != 0) {
+                                g.drawString(segment.text, x + dx, baseline + dy);
+                            }
                         }
                     }
                 }
 
                 g.setColor(new Color(segment.color | -16777216, true));
                 g.drawString(segment.text, x, baseline);
-                w = (Integer)widths.get(i);
+                step = (Integer)widths.get(i);
                 if (segment.underline) {
-                    g.fillRect(x, baseline + 2, w, Math.max(1, 2));
+                    g.fillRect(x, baseline + 2, step, Math.max(1, 2));
                 }
 
                 if (segment.strike) {
-                    g.fillRect(x, baseline - ascent / 3, w, Math.max(1, 2));
+                    g.fillRect(x, baseline - ascent / 3, step, Math.max(1, 2));
                 }
 
-                x += w;
+                x += step;
             }
 
             g.dispose();
@@ -180,7 +221,7 @@ final class LabelExport {
             if (!ImageIO.write(image, "png", png)) {
                 return null;
             } else {
-                return new Label(key, png.toByteArray(), imageWidth, imageHeight);
+                return new Label(key, png.toByteArray(), imageWidth, imageHeight, baseline);
             }
         }
     }
@@ -230,12 +271,13 @@ final class LabelExport {
         }
     }
 
-    static record Label(String key, byte[] png, int width, int height) {
-        Label(String key, byte[] png, int width, int height) {
+    static record Label(String key, byte[] png, int width, int height, int baseline) {
+        Label(String key, byte[] png, int width, int height, int baseline) {
             this.key = key;
             this.png = png;
             this.width = width;
             this.height = height;
+            this.baseline = baseline;
         }
 
         public String key() {
@@ -252,6 +294,10 @@ final class LabelExport {
 
         public int height() {
             return this.height;
+        }
+
+        public int baseline() {
+            return this.baseline;
         }
     }
 }

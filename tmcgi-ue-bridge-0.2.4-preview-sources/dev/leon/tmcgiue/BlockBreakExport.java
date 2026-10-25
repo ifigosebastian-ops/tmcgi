@@ -23,7 +23,7 @@ final class BlockBreakExport {
     }
 
     static void update(ClientLevel level, BridgeConnection connection) {
-        int generation = connection.generation();
+        int generation = connection.epoch();
         if (generation != texturesGeneration) {
             texturesGeneration = generation;
 

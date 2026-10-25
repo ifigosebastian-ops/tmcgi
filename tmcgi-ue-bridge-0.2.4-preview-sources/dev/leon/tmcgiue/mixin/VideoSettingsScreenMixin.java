@@ -30,7 +30,7 @@ public abstract class VideoSettingsScreenMixin {
         Screen self = (Screen)this;
         OptionsList list = ((OptionsSubScreenAccessor)self).tmcgiue$getList();
         list.addHeader(Component.literal("TMCGI"));
-        list.addBig(Button.builder(Component.literal("TMCGI Renderer Settings..."), (b) -> {
+        list.addBig(Button.builder(TmcgiSettingsScreen.t("button.open"), (b) -> {
             Minecraft.getInstance().gui.setScreen(new TmcgiSettingsScreen(self));
         }).build());
     }

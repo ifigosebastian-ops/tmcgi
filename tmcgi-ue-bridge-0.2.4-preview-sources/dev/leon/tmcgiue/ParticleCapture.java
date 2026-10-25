@@ -15,8 +15,6 @@ import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
@@ -88,8 +86,8 @@ final class ParticleCapture {
     }
 
     void capture(Minecraft minecraft, GameRenderer renderer, Camera camera) {
-        if (this.generation != this.connection.generation()) {
-            this.generation = this.connection.generation();
+        if (this.generation != this.connection.epoch()) {
+            this.generation = this.connection.epoch();
             this.exported.clear();
             this.pending.clear();
             this.retryAt.clear();
@@ -276,8 +274,8 @@ final class ParticleCapture {
             NativeImage image = new NativeImage(Format.RGBA, width, height, true);
 
             byte[] png;
-            label114: {
-                boolean var24;
+            label49: {
+                boolean var19;
                 try {
                     Iterator var9 = List.copyOf(sprites).iterator();
 
@@ -297,30 +295,23 @@ final class ParticleCapture {
                     }
 
                     if (copied != 0) {
-                        Path temp = Files.createTempFile("tmcgi-atlas", ".png");
-
-                        try {
-                            image.writeToFile(temp);
-                            png = Files.readAllBytes(temp);
-                            break label114;
-                        } finally {
-                            Files.deleteIfExists(temp);
-                        }
+                        png = EntityCapture.encodePng(image);
+                        break label49;
                     }
 
-                    var24 = false;
-                } catch (Throwable var22) {
+                    var19 = false;
+                } catch (Throwable var17) {
                     try {
                         image.close();
-                    } catch (Throwable var20) {
-                        var22.addSuppressed(var20);
+                    } catch (Throwable var16) {
+                        var17.addSuppressed(var16);
                     }
 
-                    throw var22;
+                    throw var17;
                 }
 
                 image.close();
-                return var24;
+                return var19;
             }
 
             image.close();

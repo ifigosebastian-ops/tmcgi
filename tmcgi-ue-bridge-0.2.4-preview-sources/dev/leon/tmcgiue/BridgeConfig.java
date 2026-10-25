@@ -26,7 +26,6 @@ final class BridgeConfig {
     String rendererArguments = "";
     boolean lod = true;
     int lodMaxChunks = 256;
-    boolean compatWorldRender = true;
     boolean captureCustomGeometry = true;
     String hiddenParticles = "minecraft:rain";
 
@@ -76,7 +75,6 @@ final class BridgeConfig {
         config.rendererArguments = properties.getProperty("renderer.arguments", config.rendererArguments).trim();
         config.hiddenParticles = properties.getProperty("particles.hidden", config.hiddenParticles).trim();
         config.lod = Boolean.parseBoolean(properties.getProperty("lod", Boolean.toString(config.lod)));
-        config.compatWorldRender = Boolean.parseBoolean(properties.getProperty("compat.worldRender", Boolean.toString(config.compatWorldRender)));
         config.captureCustomGeometry = Boolean.parseBoolean(properties.getProperty("capture.customGeometry", Boolean.toString(config.captureCustomGeometry)));
         config.lodMaxChunks = Math.max(32, Math.min(512, parseInt(properties.getProperty("lod.maxChunks"), config.lodMaxChunks)));
         properties.setProperty("enabled", Boolean.toString(config.enabled));
@@ -90,7 +88,6 @@ final class BridgeConfig {
         properties.setProperty("renderer.arguments", config.rendererArguments);
         properties.setProperty("particles.hidden", config.hiddenParticles);
         properties.setProperty("lod", Boolean.toString(config.lod));
-        properties.setProperty("compat.worldRender", Boolean.toString(config.compatWorldRender));
         properties.setProperty("capture.customGeometry", Boolean.toString(config.captureCustomGeometry));
         properties.setProperty("lod.maxChunks", Integer.toString(config.lodMaxChunks));
 

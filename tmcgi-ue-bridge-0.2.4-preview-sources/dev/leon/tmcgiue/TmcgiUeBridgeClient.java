@@ -22,6 +22,9 @@ import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome.Precipitation;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
+import org.joml.Vector3f;
 import org.joml.Vector3fc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,10 +41,13 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
     private static boolean lastGrabbed;
     private static int cursorGeneration = -1;
     private static int frame;
-    private static boolean compatWorldRender = System.getenv("TMCGI_COMPAT_WORLD_RENDER") != null || System.getenv("TMCGI_NO_SKIP") != null;
     public static volatile boolean discardDraws;
+    private static final Matrix4f BOBBING = new Matrix4f();
+    private static boolean bobbingCaptured;
+    private static boolean bobbingReported;
     private static boolean captureCustomGeometry = System.getenv("TMCGI_CAPTURE_CUSTOM_GEOMETRY") != null;
     private static List<String> selectedPacks;
+    private static boolean packsChanged;
     private static final long MIDNIGHT_CLOCK = 18000L;
     private static final boolean ENTITIES = System.getenv("TMCGI_NO_ENTITIES") == null;
     private static EntityCapture entityCapture;
@@ -52,17 +58,19 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
     private static int weatherGeneration = -1;
     private static final float[] SENT_TINT = new float[]{-1.0F, -1.0F, -1.0F};
     private static int tintGeneration = -1;
+    private static int settingsOverflows;
 
     public TmcgiUeBridgeClient() {
     }
 
-    public static boolean compatWorldRender() {
-        return compatWorldRender;
-    }
+    public static void captureBobbing(Matrix4fc bobbing) {
+        BOBBING.set(bobbing);
+        bobbingCaptured = true;
+        if (!bobbingReported) {
+            bobbingReported = true;
+            LOGGER.info("Camera bobbing: taken from Minecraft's drawing of the world");
+        }
 
-    public static void setCompatWorldRender(boolean value) {
-        compatWorldRender = value;
-        BridgeConfig.store("compat.worldRender", Boolean.toString(value));
     }
 
     public static boolean captureCustomGeometry() {
@@ -75,14 +83,9 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
             LOGGER.info("TMCGI UE bridge is disabled in the config");
         } else {
             HiddenParticles.set(config.hiddenParticles);
-            compatWorldRender |= config.compatWorldRender;
             captureCustomGeometry |= config.captureCustomGeometry;
             if (captureCustomGeometry) {
                 LOGGER.info("TMCGI UE bridge: recording the custom geometry that mods submit");
-            }
-
-            if (compatWorldRender) {
-                LOGGER.info("TMCGI UE bridge: compatibility mode, Minecraft draws its own world and its picture is discarded");
             }
 
             TmcgiSettings.load();
@@ -122,6 +125,16 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
             selectedPacks = now;
         } else if (!now.equals(selectedPacks)) {
             selectedPacks = now;
+            packsChanged = true;
+        }
+
+        if (packsChanged && client.gui.overlay() == null) {
+            packsChanged = false;
+            if (entityCapture != null) {
+                entityCapture.close();
+                entityCapture = null;
+            }
+
             TmcgiSettings.resourcePacksChanged();
         }
 
@@ -172,19 +185,24 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
     public static void onFrameRendered(GameRenderer renderer) {
         EntityCensus.frame(renderer.gameRenderState().levelRenderState);
         if (connection != null && connection.isConnected()) {
+            if (connection.overflows() != settingsOverflows) {
+                settingsOverflows = connection.overflows();
+                connection.sendUrgent(TmcgiSettings.frame());
+            }
+
             RenderTarget mainTarget = renderer.mainRenderTarget();
-            if (mainTarget.width != sentWidth || mainTarget.height != sentHeight || connection.generation() != resolutionGeneration) {
+            if (mainTarget.width != sentWidth || mainTarget.height != sentHeight || connection.epoch() != resolutionGeneration) {
                 sentWidth = mainTarget.width;
                 sentHeight = mainTarget.height;
-                resolutionGeneration = connection.generation();
+                resolutionGeneration = connection.epoch();
                 connection.send(BridgeProtocol.resolution(sentWidth, sentHeight));
             }
 
             if (overlayActive()) {
                 boolean grabbed = Minecraft.getInstance().mouseHandler.isMouseGrabbed();
-                if (grabbed != lastGrabbed || connection.generation() != cursorGeneration) {
+                if (grabbed != lastGrabbed || connection.epoch() != cursorGeneration) {
                     lastGrabbed = grabbed;
-                    cursorGeneration = connection.generation();
+                    cursorGeneration = connection.epoch();
                     connection.send(BridgeProtocol.cursor(grabbed));
                 }
 
@@ -206,11 +224,11 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
                     snow = level.getPrecipitationAt(weatherCamera.blockPosition()) == Precipitation.SNOW;
                 }
 
-                if (Math.abs(rain - sentRain) > 0.002F || Math.abs(thunder - sentThunder) > 0.002F || snow != sentSnow || connection.generation() != weatherGeneration) {
+                if (Math.abs(rain - sentRain) > 0.002F || Math.abs(thunder - sentThunder) > 0.002F || snow != sentSnow || connection.epoch() != weatherGeneration) {
                     sentRain = rain;
                     sentThunder = thunder;
                     sentSnow = snow;
-                    weatherGeneration = connection.generation();
+                    weatherGeneration = connection.epoch();
                     connection.sendUrgent(BridgeProtocol.weather(rain, thunder, snow));
                 }
             }
@@ -222,29 +240,33 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
             Camera tintCamera = renderer.mainCamera();
             if (level != null && tintCamera != null && tintCamera.isInitialized()) {
                 Vector3fc tint = (Vector3fc)tintCamera.attributeProbe().getValue(EnvironmentAttributes.BLOCK_LIGHT_TINT, Minecraft.getInstance().getDeltaTracker().getGameTimeDeltaPartialTick(false));
-                if (Math.abs(tint.x() - SENT_TINT[0]) > 0.002F || Math.abs(tint.y() - SENT_TINT[1]) > 0.002F || Math.abs(tint.z() - SENT_TINT[2]) > 0.002F || connection.generation() != tintGeneration) {
+                if (Math.abs(tint.x() - SENT_TINT[0]) > 0.002F || Math.abs(tint.y() - SENT_TINT[1]) > 0.002F || Math.abs(tint.z() - SENT_TINT[2]) > 0.002F || connection.epoch() != tintGeneration) {
                     SENT_TINT[0] = tint.x();
                     SENT_TINT[1] = tint.y();
                     SENT_TINT[2] = tint.z();
-                    tintGeneration = connection.generation();
+                    tintGeneration = connection.epoch();
                     connection.sendUrgent(BridgeProtocol.blockLight(tint.x(), tint.y(), tint.z()));
                 }
             }
 
-            Camera particleCamera;
+            if (level != null) {
+                DynamicLights.update(Minecraft.getInstance(), renderer.mainCamera(), connection);
+            }
+
+            Camera camera;
             if (ENTITIES) {
                 if (entityCapture == null) {
                     entityCapture = new EntityCapture(connection);
                 }
 
                 entityCapture.capture(Minecraft.getInstance(), renderer);
-                particleCamera = renderer.mainCamera();
-                if (particleCamera != null && particleCamera.isInitialized()) {
+                camera = renderer.mainCamera();
+                if (camera != null && camera.isInitialized()) {
                     if (particleCapture == null) {
                         particleCapture = new ParticleCapture(connection);
                     }
 
-                    particleCapture.capture(Minecraft.getInstance(), renderer, particleCamera);
+                    particleCapture.capture(Minecraft.getInstance(), renderer, camera);
                 }
             }
 
@@ -252,12 +274,24 @@ public final class TmcgiUeBridgeClient implements ClientModInitializer {
                 tracker.flushUrgent();
             }
 
-            particleCamera = renderer.mainCamera();
-            if (level != null && particleCamera != null && particleCamera.isInitialized()) {
-                Vec3 position = particleCamera.position();
-                Vector3fc forward = particleCamera.forwardVector();
-                Vector3fc up = particleCamera.upVector();
-                connection.sendPose(BridgeProtocol.pose(position.x, position.y, position.z, forward.x(), forward.y(), forward.z(), up.x(), up.y(), up.z(), particleCamera.getFov(), worldClock(level), frame++));
+            camera = renderer.mainCamera();
+            if (level != null && camera != null && camera.isInitialized()) {
+                Vec3 position = camera.position();
+                Vector3fc forward = camera.forwardVector();
+                Vector3fc up = camera.upVector();
+                Matrix4f inverse = bobbingCaptured ? (new Matrix4f(BOBBING)).invert() : new Matrix4f();
+                bobbingCaptured = false;
+                Vector3f bobForward = inverse.transformDirection(new Vector3f(0.0F, 0.0F, -1.0F)).normalize();
+                Vector3f bobUp = inverse.transformDirection(new Vector3f(0.0F, 1.0F, 0.0F));
+                bobUp.fma(-bobUp.dot(bobForward), bobForward).normalize();
+                Vector3f bobOffset = inverse.transformPosition(new Vector3f());
+                if (!bobForward.isFinite() || !bobUp.isFinite() || !bobOffset.isFinite()) {
+                    bobForward.set(0.0F, 0.0F, -1.0F);
+                    bobUp.set(0.0F, 1.0F, 0.0F);
+                    bobOffset.zero();
+                }
+
+                connection.sendPose(BridgeProtocol.pose(position.x, position.y, position.z, forward.x(), forward.y(), forward.z(), up.x(), up.y(), up.z(), camera.getFov(), worldClock(level), frame++, new float[]{-bobForward.z, bobForward.x, bobForward.y, -bobUp.z, bobUp.x, bobUp.y, -bobOffset.z, bobOffset.x, bobOffset.y}));
             }
         }
     }

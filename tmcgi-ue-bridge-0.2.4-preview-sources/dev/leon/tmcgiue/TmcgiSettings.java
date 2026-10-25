@@ -21,19 +21,19 @@ import java.util.Properties;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
-import net.minecraft.network.chat.Component;
 
 public final class TmcgiSettings {
     static final int[] QUALITY_LEVELS = new int[]{0, 1, 2, 3, 4};
-    static final String[] QUALITY_NAMES = new String[]{"Low", "Medium", "High", "Epic", "Cinematic"};
+    static final String[] QUALITY_NAMES = new String[]{"quality.low", "quality.medium", "quality.high", "quality.epic", "quality.cinematic"};
     static final int[] RESOLUTION_LEVELS = new int[]{50, 60, 70, 75, 80, 85, 90, 100};
     static final int[] ANTI_ALIASING_METHODS = new int[]{1, 2, 4};
     static final String[] ANTI_ALIASING_NAMES = new String[]{"FXAA", "TAA", "TSR"};
+    static final int BLOCK_LIGHT_MIN = 2;
+    static final int BLOCK_LIGHT_MAX = 200;
     static final int[] RAY_TRACING_DISTANCES = new int[]{2, 3, 4, 6, 8, 12, 0};
-    static final String[] RAY_TRACING_DISTANCE_NAMES = new String[]{"2 Chunks", "3 Chunks", "4 Chunks", "6 Chunks", "8 Chunks", "12 Chunks", "Unlimited"};
     static final int[] CLOUD_MODES = new int[]{0, 1, 2, 3};
-    static final String[] CLOUD_NAMES = new String[]{"Background only", "Performance", "Quality", "Cinematic"};
-    static final String[] PRESET_NAMES = new String[]{"Low", "Medium", "High", "Ultra"};
+    static final String[] CLOUD_NAMES = new String[]{"cloud.background", "cloud.performance", "cloud.quality", "cloud.cinematic"};
+    static final String[] PRESET_NAMES = new String[]{"preset.low", "preset.medium", "preset.high", "preset.ultra"};
     static int cloudMode;
     static boolean volumetricFog;
     static int resolutionQuality;
@@ -49,6 +49,10 @@ public final class TmcgiSettings {
     static int antiAliasingMethod;
     static boolean lumen;
     static boolean megaLights;
+    static boolean lightLimit;
+    static boolean motionBlur;
+    static boolean dynamicLights;
+    static int blockLightIntensity;
     static boolean hardwareRayTracing;
     static int rayTracingDistance;
     static boolean statUnit;
@@ -71,11 +75,11 @@ public final class TmcgiSettings {
     private static void setDefaults() {
         cloudMode = 1;
         volumetricFog = true;
-        resolutionQuality = 100;
-        viewDistanceQuality = 2;
-        antiAliasingQuality = 2;
-        shadowQuality = 2;
-        globalIlluminationQuality = 2;
+        resolutionQuality = 50;
+        viewDistanceQuality = 1;
+        antiAliasingQuality = 1;
+        shadowQuality = 1;
+        globalIlluminationQuality = 1;
         reflectionQuality = 2;
         postProcessQuality = 2;
         textureQuality = 2;
@@ -84,8 +88,12 @@ public final class TmcgiSettings {
         antiAliasingMethod = 4;
         lumen = true;
         megaLights = true;
+        lightLimit = false;
+        motionBlur = true;
+        dynamicLights = true;
+        blockLightIntensity = 100;
         hardwareRayTracing = true;
-        rayTracingDistance = 6;
+        rayTracingDistance = 2;
         statUnit = true;
         engineWarnings = true;
         bakingDebug = true;
@@ -145,6 +153,10 @@ public final class TmcgiSettings {
         antiAliasingMethod = pick(p, "render.antiAliasingMethod", antiAliasingMethod, ANTI_ALIASING_METHODS);
         lumen = bool(p, "render.lumen", lumen);
         megaLights = bool(p, "render.megaLights", megaLights);
+        lightLimit = bool(p, "render.lightLimit", lightLimit);
+        motionBlur = bool(p, "render.motionBlur", motionBlur);
+        dynamicLights = bool(p, "render.dynamicLights", dynamicLights);
+        blockLightIntensity = Math.max(2, Math.min(200, integer(p, "render.blockLightIntensity", blockLightIntensity)));
         hardwareRayTracing = bool(p, "render.hardwareRayTracing", hardwareRayTracing);
         rayTracingDistance = pick(p, "render.rayTracingDistance", rayTracingDistance, RAY_TRACING_DISTANCES);
         statUnit = bool(p, "ue.statUnit", statUnit);
@@ -198,6 +210,10 @@ public final class TmcgiSettings {
         m.put("render.antiAliasingMethod", Integer.toString(antiAliasingMethod));
         m.put("render.lumen", Boolean.toString(lumen));
         m.put("render.megaLights", Boolean.toString(megaLights));
+        m.put("render.lightLimit", Boolean.toString(lightLimit));
+        m.put("render.motionBlur", Boolean.toString(motionBlur));
+        m.put("render.dynamicLights", Boolean.toString(dynamicLights));
+        m.put("render.blockLightIntensity", Integer.toString(blockLightIntensity));
         m.put("render.hardwareRayTracing", Boolean.toString(hardwareRayTracing));
         m.put("render.rayTracingDistance", Integer.toString(rayTracingDistance));
         m.put("ue.statUnit", Boolean.toString(statUnit));
@@ -261,7 +277,7 @@ public final class TmcgiSettings {
             Minecraft minecraft = Minecraft.getInstance();
             boolean restarted = RendererLauncher.restart();
             if (minecraft.gui != null) {
-                minecraft.gui.hud.getChat().addClientSystemMessage(Component.literal(restarted ? "[TMCGI] Settings changed: restarting the renderer to apply them..." : "[TMCGI] Settings changed: the renderer was not started by Minecraft, please restart it by hand to apply them."));
+                minecraft.gui.hud.getChat().addClientSystemMessage(TmcgiSettingsScreen.t(restarted ? "chat.settingsRestart" : "chat.settingsManual"));
             }
 
             if (restarted) {
@@ -276,7 +292,7 @@ public final class TmcgiSettings {
         Minecraft minecraft = Minecraft.getInstance();
         boolean restarted = RendererLauncher.restart();
         if (minecraft.gui != null) {
-            minecraft.gui.hud.getChat().addClientSystemMessage(Component.literal(restarted ? "[TMCGI] Resource packs changed: restarting the renderer to load them..." : "[TMCGI] Resource packs changed: the renderer was not started by Minecraft, please restart it by hand to load them."));
+            minecraft.gui.hud.getChat().addClientSystemMessage(TmcgiSettingsScreen.t(restarted ? "chat.packsRestart" : "chat.packsManual"));
         }
 
     }
@@ -303,11 +319,11 @@ public final class TmcgiSettings {
             boolean rayTracing = (flags & 4) != 0;
             List<String> lines = new ArrayList();
             if (hardwareRayTracing && launchedWithRayTracing && !rayTracing) {
-                lines.add("[TMCGI] Hardware ray tracing is not enabled: this system or hardware may not support it.");
+                lines.add("chat.noRayTracing");
             }
 
             if (megaLights && !rayTracing) {
-                lines.add("[TMCGI] MegaLights cannot be enabled: hardware ray tracing is not in use.");
+                lines.add("chat.noMegaLights");
             }
 
             String text = String.join("\n", lines);
@@ -319,7 +335,7 @@ public final class TmcgiSettings {
 
                     while(var5.hasNext()) {
                         String line = (String)var5.next();
-                        minecraft.gui.hud.getChat().addClientSystemMessage(Component.literal(line).withStyle(ChatFormatting.RED));
+                        minecraft.gui.hud.getChat().addClientSystemMessage(TmcgiSettingsScreen.t(line).withStyle(ChatFormatting.RED));
                     }
 
                 }
